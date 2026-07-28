@@ -33,6 +33,9 @@ def deep_compare(dict1: Any, dict2: Any) -> bool:
         return dict1 == dict2
 
 
+_FALLBACK_FUSED_SHARDS_AMD = {"qkv_proj": ["q_proj", "k_proj", "v_proj"], "gate_up_proj": ["gate_proj", "up_proj"], "index_qkv_proj": ["index_q_proj", "index_k_proj", "index_v_proj"]}
+
+
 def should_ignore_layer(
     layer_name: Optional[str],
     ignore: Iterable[str],
@@ -49,8 +52,9 @@ def should_ignore_layer(
     # in the safetensors checkpoint. So, we convert the name
     # from the fused version to unfused + check to make sure that
     # each shard of the fused layer has the same scheme.
-    if proj_name in fused_mapping:
-        shard_proj_names = fused_mapping[proj_name]
+    effective_fused = fused_mapping if proj_name in fused_mapping else _FALLBACK_FUSED_SHARDS_AMD
+    if proj_name in effective_fused:
+        shard_proj_names = effective_fused[proj_name]
 
         # Convert fused_name --> [shard_names]
         shard_names = [
@@ -58,24 +62,13 @@ def should_ignore_layer(
             for shard_proj_name in shard_proj_names
         ]
 
-        # Layer should be ignored if shards are ignored.
-        should_ignore_layer = None
-        for shard_name in shard_names:
-            should_ignore_shard = check_equal_or_regex_match(
-                layer_name=shard_name, targets=ignore
-            )
-
-            # If shard_idx=0, set layer ignore to match shard.
-            if should_ignore_layer is None:
-                should_ignore_layer = should_ignore_shard
-
-            # If shard_idx=1+ confirm scheme matches prior shards.
-            elif should_ignore_shard != should_ignore_layer:
-                raise ValueError(
-                    f"Found different quantization schemes for "
-                    f"{shard_proj_names} in {layer_name}. SGLang "
-                    "requires all to use the same scheme."
-                )
+        # Ignore layer if ANY shard is ignored; tolerant of absent shards
+        # (MiniMax-M3 DSA disables index_v_proj on layers 3+).
+        shard_flags = [
+            check_equal_or_regex_match(layer_name=shard_name, targets=ignore)
+            for shard_name in shard_names
+        ]
+        should_ignore_layer = any(shard_flags)
 
     # Unfused layers like down_proj and o_proj will match
     # the safetensors checkpoint already.
